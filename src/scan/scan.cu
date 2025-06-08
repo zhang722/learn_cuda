@@ -5,17 +5,26 @@
 constexpr int ThreadPerBlock = 2;
 constexpr int ElementPerBlock = ThreadPerBlock * 2;
 
+constexpr int NumBanks = 32;
+constexpr int LogNumBanks = 5;
+#define BANK_CONFLICT_FREE(n) ((n) >> LogNumBanks)
+#define MAX_SHARE_SIZE (ElementPerBlock + BANK_CONFLICT_FREE(ElementPerBlock - 1))
+
 __global__ void scan_block(int* a, int* output, int *block_sums, int n) {
     // load
-    __shared__ int temp[ElementPerBlock];
+    __shared__ int temp[MAX_SHARE_SIZE];
     int idx = blockDim.x * blockIdx.x + threadIdx.x; //2
     int tid = threadIdx.x; //0
     int bid = blockIdx.x;
+    int ai = 2 * tid;
+    int bi = 2 * tid + 1;
+    int bankOffsetA = BANK_CONFLICT_FREE(ai);
+    int bankOffsetB = BANK_CONFLICT_FREE(bi);
     if (2 * idx < n) {
-        temp[2 * tid] = a[2 * idx]; 
+        temp[ai + bankOffsetA] = a[2 * idx]; 
     }
     if (2 * idx + 1 < n) {
-        temp[2 * tid + 1] = a[2 * idx + 1];
+        temp[bi + bankOffsetB] = a[2 * idx + 1];
     }
 
     int t = ElementPerBlock >> 1;
@@ -26,13 +35,16 @@ __global__ void scan_block(int* a, int* output, int *block_sums, int n) {
             int i = k + s - 1; 
             int j = k + 2 * s - 1;
 
+            i += BANK_CONFLICT_FREE(i);
+            j += BANK_CONFLICT_FREE(j);
+
             temp[j] += temp[i];
         }
         t >>= 1;
     }
 
     if (tid == 0) {
-        block_sums[bid] = temp[ElementPerBlock - 1];
+        block_sums[bid] = temp[MAX_SHARE_SIZE - 1];
         temp[ElementPerBlock - 1] = 0;
     }
     t = 1;
@@ -42,6 +54,8 @@ __global__ void scan_block(int* a, int* output, int *block_sums, int n) {
             int k = tid * 2 * s;
             int i = k + s - 1; 
             int j = k + 2 * s - 1;
+            i += BANK_CONFLICT_FREE(i);
+            j += BANK_CONFLICT_FREE(j);
 
             int tt = temp[j];
             temp[j] += temp[i];
@@ -53,12 +67,13 @@ __global__ void scan_block(int* a, int* output, int *block_sums, int n) {
     __syncthreads();
 
     if (2 * idx < n) {
-        output[2 * idx] =  temp[2 * tid]; 
+        output[2 * idx] =  temp[ai + bankOffsetA]; 
     }
     if (2 * idx + 1 < n) {
-        output[2 * idx + 1] = temp[2 * tid + 1];
+        output[2 * idx + 1] = temp[bi + bankOffsetB];
     }
 }
+
 
 
 

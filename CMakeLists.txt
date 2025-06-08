@@ -7,11 +7,7 @@ add_executable(
     src/test.cu
 )
 
-add_executable(
-    template
 
-    src/template.cu
-)
 
 add_executable(
     scan

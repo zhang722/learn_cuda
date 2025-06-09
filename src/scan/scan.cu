@@ -2,13 +2,28 @@
 #include <iostream>
 #include <stdio.h>
 
-constexpr int ThreadPerBlock = 2;
+#include "options.h"
+
+constexpr int ThreadPerBlock = 64;
 constexpr int ElementPerBlock = ThreadPerBlock * 2;
 
-constexpr int NumBanks = 32;
+// constexpr int NumBanks = 32;
 constexpr int LogNumBanks = 5;
 #define BANK_CONFLICT_FREE(n) ((n) >> LogNumBanks)
 #define MAX_SHARE_SIZE (ElementPerBlock + BANK_CONFLICT_FREE(ElementPerBlock - 1))
+
+constexpr int WarpSize = 32;
+
+void print(int *d_a, int n) {
+    int *a = new int[n];
+    cudaMemcpy(a, d_a, n * sizeof(int), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < n; i++) {
+        printf("%d,", a[i]);
+    }
+    printf("\n");
+    delete[] a;
+}
+
 
 __global__ void scan_block(int* a, int* output, int *block_sums, int n) {
     // load
@@ -45,7 +60,7 @@ __global__ void scan_block(int* a, int* output, int *block_sums, int n) {
 
     if (tid == 0) {
         block_sums[bid] = temp[MAX_SHARE_SIZE - 1];
-        temp[ElementPerBlock - 1] = 0;
+        temp[MAX_SHARE_SIZE - 1] = 0;
     }
     t = 1;
     for (int s = ElementPerBlock >> 1; s > 0; s >>= 1) {
@@ -93,61 +108,201 @@ __global__ void add_kernel(int *output, int *sums, int n) {
 
 
 
-void scan_large(int *input, int *output, int n) {
-    int *d_input;
-    int *d_output;
+void scan_large(int *d_input, int *d_output, int n) {
     int *d_sums;
     int *d_sums_sums;
-    
-    cudaMalloc(&d_input, n * sizeof(int));
-    cudaMalloc(&d_output, n * sizeof(int));
-
-    cudaMemcpy(d_input, input, n * sizeof(int), cudaMemcpyHostToDevice);
 
     int numBlock = (n + ElementPerBlock - 1) / ElementPerBlock;
 
     cudaMalloc(&d_sums, numBlock * sizeof(int));
     cudaMalloc(&d_sums_sums, numBlock * sizeof(int));
 
-    {
-        cudaEvent_t start, stop;
-        float elapsedTime = 0.0;
+    scan_block<<<numBlock, ThreadPerBlock>>>(d_input, d_output, d_sums, n);
 
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-        cudaEventRecord(start);
-        scan_block<<<numBlock, ThreadPerBlock>>>(d_input, d_output, d_sums, n);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&elapsedTime, start, stop);
-        printf("scan_large time: %f ms\n", elapsedTime);
-    }
     if (numBlock != 1) {
         scan_large(d_sums, d_sums_sums, numBlock);
-        cudaEvent_t start, stop;
-        float elapsedTime = 0.0;
-
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-        cudaEventRecord(start);
         add_kernel<<<numBlock, ThreadPerBlock>>>(d_output, d_sums_sums, n);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&elapsedTime, start, stop);
-        printf("add_kernel time: %f ms\n", elapsedTime);
     } 
+}
 
+void scan_large_wrapper(int *input, int *output, int n) {
+    int *d_input;
+    int *d_output;
+    
+    cudaMalloc(&d_input, n * sizeof(int));
+    cudaMalloc(&d_output, n * sizeof(int));
+
+    cudaMemcpy(d_input, input, n * sizeof(int), cudaMemcpyHostToDevice);
+    scan_large(d_input, d_output, n);
     cudaMemcpy(output, d_output, n * sizeof(int), cudaMemcpyDeviceToHost);
 }
 
 
 
-int main() {
-    int input[] = {1, 2, 3, 0, 1, 1, 1, 1, 1};
-    int output[] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
-    scan_large(input, output, 9);
-    for (int i = 0; i < 9; i++) {
-        std::cout << output[i] << ',';
+__device__ int scan_warp(int val) {
+    int x = val;
+    for (int offset = 1; offset < WarpSize; offset <<= 1) {
+        int y = __shfl_up_sync(0xffffffff, x, offset);
+        if (threadIdx.x % WarpSize >= offset) {
+            x += y;
+        }
     }
-    std::cout << std::endl;
+    return x - val;
+}
+
+__global__ void scan_warp_block(int *a, int *output, int *block_sums, int n) {
+    // constexpr int NumWarpsPerBlock = ThreadPerBlock / WarpSize;
+    __shared__ int sums[WarpSize];
+    __shared__ int temp[ThreadPerBlock];
+
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int idx = blockDim.x * bid + tid;
+    int lane = tid % WarpSize;
+    int wid = tid / WarpSize;
+    if (idx < n) {
+        temp[tid] = a[idx];
+    }
+    int val = temp[tid];
+
+    // scan per warp
+    int sum = scan_warp(temp[tid]);
+    if (lane == WarpSize - 1) {
+        sums[wid] = sum + temp[tid];
+    }
+    temp[tid] = sum;
+
+    __syncthreads();
+
+    if (wid == 0) {
+        int all_sum = scan_warp(sums[lane]);
+        sums[lane] = all_sum;
+    }
+
+    __syncthreads();
+    temp[tid] += sums[wid];
+
+    if (idx < n) {
+        output[idx] = temp[tid];
+    }
+
+    if (tid == ThreadPerBlock - 1) {
+        block_sums[bid] = temp[tid] + val;
+    }
+}
+
+
+
+void scan_warp_large(int *d_input, int *d_output, int n) {
+    int numBlock = (n + ThreadPerBlock - 1) / ThreadPerBlock;
+    int *d_sums;
+    int *d_sums_sums;
+    cudaMalloc(&d_sums, numBlock * sizeof(int));
+    cudaMalloc(&d_sums_sums, numBlock * sizeof(int));
+
+    scan_warp_block<<<numBlock, ThreadPerBlock>>>(d_input, d_output, d_sums, n);
+
+    if (numBlock != 1) {
+        scan_warp_large(d_sums, d_sums_sums, numBlock);
+
+        add_kernel<<<numBlock, ThreadPerBlock / 2>>>(d_output, d_sums_sums, n);
+    } 
+}
+
+void scan_warp_large_wrapper(int *input, int *output, int n) {
+    int *d_input;
+    int *d_output;
+    
+    cudaMalloc(&d_input, n * sizeof(int));
+    cudaMalloc(&d_output, n * sizeof(int));
+
+    cudaMemcpy(d_input, input, n * sizeof(int), cudaMemcpyHostToDevice);
+    scan_warp_large(d_input, d_output, n);
+    cudaMemcpy(output, d_output, n * sizeof(int), cudaMemcpyDeviceToHost);
+}
+
+
+
+__global__ void find_repeats_kernel(int *input, int *output, int n) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx < n - 1) {
+        if (input[idx] == input[idx + 1]) {
+            output[idx] = 1;
+        } else {
+            output[idx] = 0;
+        }
+    }
+}
+
+
+__global__ void indexing_kernel(int *d_repeat, int *d_sums, int *d_output, int n) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (idx < n) {
+        if (d_repeat[idx] == 1) {
+            d_output[d_sums[idx]] = idx;
+        }
+    }
+}
+
+
+void find_repeats(int *input, int * &output, int n, int &n_output) {
+    int *d_input;
+    int *d_repeat;
+    
+    cudaMalloc(&d_input, n * sizeof(int));
+    cudaMalloc(&d_repeat, n * sizeof(int));
+
+    cudaMemcpy(d_input, input, n * sizeof(int), cudaMemcpyHostToDevice);
+
+    int numBlock = (n + ThreadPerBlock - 1) / ThreadPerBlock;
+
+    find_repeats_kernel<<<numBlock, ThreadPerBlock>>>(d_input, d_repeat, n);
+
+    int *d_sums;
+    cudaMalloc(&d_sums, n * sizeof(int));
+    scan_warp_large(d_repeat, d_sums, n);
+
+    int num_repeat;
+    cudaMemcpy(&num_repeat, d_sums + n - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+    int *d_output;
+    cudaMalloc(&d_output, num_repeat * sizeof(int));
+
+    indexing_kernel<<<numBlock, ThreadPerBlock>>>(d_repeat, d_sums, d_output, n);
+
+    n_output = num_repeat;
+    int *out = new int[num_repeat];
+    cudaMemcpy(out, d_output, num_repeat * sizeof(int), cudaMemcpyDeviceToHost);
+    output = out;
+}
+
+
+
+int main(int argc, char* argv[]) {
+    ProgramOptions opts = parse_arguments(argc, argv);
+
+    std::cout << "test_type  = " << opts.test_type << "\n";
+    std::cout << "input_type = " << opts.input_type << "\n";
+    std::cout << "array_size = " << opts.array_size << "\n";
+    std::cout << "use_thrust = " << (opts.use_thrust ? "true" : "false") << "\n";
+
+
+    int N = opts.array_size;
+    int *input = new int[N];
+    int *output = new int[N];
+
+    for (int i = 0; i < N; i++) {
+        input[i] = 1;
+    }
+
+    if (opts.input_type == "scan") {
+        scan_large_wrapper(input, output, N);
+        // scan_warp_large_wrapper(input, output, N);
+    } else if (opts.input_type == "find_repeats ") {
+        int *out = nullptr;
+        int num_repeat;
+        find_repeats(input, out, N, num_repeat);
+        delete[] out;
+    }
 }

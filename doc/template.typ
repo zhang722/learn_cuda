@@ -12,6 +12,17 @@
   )
   show math.equation: set text(weight: 400,font:"New Computer Modern Math")
   show raw: set text(weight: 400,font:("Fira Code"))
+  show raw.where(block: false): box.with(
+    fill: luma(240),
+    inset: (x: 3pt, y: 0pt),
+    outset: (y: 3pt),
+    radius: 2pt,
+  )
+  show raw.where(block: true): block.with(
+    fill: luma(240),
+    inset: 10pt,
+    radius: 4pt,
+  )
   show heading: it => [
   #set text(weight: 600,0.9em)
   #block(smallcaps(it.body))

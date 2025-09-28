@@ -1,0 +1,6 @@
+get_filename_component(CURRENT_DIR_NAME ${CMAKE_CURRENT_LIST_DIR} NAME)
+file(GLOB SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.cu"
+)
+add_executable(${CURRENT_DIR_NAME} ${SOURCES})

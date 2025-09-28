@@ -94,10 +94,11 @@ def calculate_scores(correct, your_times, fast_times):
         stu_time = your_times[element_count]
 
         if correct[element_count]:
-            if stu_time <= 1.20 * ref_time:
-                score = perf_points
-            else:
-                score = perf_points * (ref_time / stu_time)
+            # if stu_time <= 1.20 * ref_time:
+            #     score = perf_points
+            # else:
+            #     score = perf_points * (ref_time / stu_time)
+            score = 0
         else:
             score = 0
 
